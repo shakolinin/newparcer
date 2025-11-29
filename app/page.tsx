@@ -1,18 +1,20 @@
 'use client';
 
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Search, RefreshCw, Loader2, ExternalLink, ArrowUpDown, Filter, X } from 'lucide-react';
 import { Position } from './api/scrape/route';
 
-type SortField = 'value' | 'avgPrice' | 'marketName' | 'outcome';
+type SortField = 'value' | 'currentPrice' | 'marketName' | 'outcome' | 'trader';
 type SortDirection = 'asc' | 'desc';
 
 export default function Home() {
-  const [profileUrl, setProfileUrl] = useState('https://polymarket.com/@FirstOrder?tab=positions');
+  const [profileUrls, setProfileUrls] = useState<string[]>(['https://polymarket.com/@FirstOrder?tab=positions', '', '']);
   const [positions, setPositions] = useState<Position[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState<{ [index: number]: { loading: boolean; error: string | null } }>({});
   const [error, setError] = useState<string | null>(null);
   const [filterText, setFilterText] = useState('');
+  const [debouncedFilterText, setDebouncedFilterText] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [refreshIntervalMinutes, setRefreshIntervalMinutes] = useState(1);
   const [timeUntilRefresh, setTimeUntilRefresh] = useState(0);
@@ -21,43 +23,75 @@ export default function Home() {
   
   // Column filters (Excel-like)
   const [columnFilters, setColumnFilters] = useState({
+    trader: '',
     marketName: '',
     outcome: '',
-    avgPrice: '',
+    currentPrice: '',
+    value: '',
+  });
+  
+  // Debounced column filters
+  const [debouncedColumnFilters, setDebouncedColumnFilters] = useState({
+    trader: '',
+    marketName: '',
+    outcome: '',
+    currentPrice: '',
     value: '',
   });
   
   // Range filters for numeric columns
   const [rangeFilters, setRangeFilters] = useState({
-    avgPrice: { min: '', max: '' },
+    currentPrice: { min: '', max: '' },
     value: { min: '', max: '' },
   });
   
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const debounceTimersRef = useRef<{ [key: string]: NodeJS.Timeout }>({});
+  const isLoadingRef = useRef<boolean>(false);
 
-  // Fetch positions
-  const fetchPositions = async () => {
-    if (!profileUrl) {
-      setError('Please enter a profile URL');
-      return;
+  // Cache key generator
+  const getCacheKey = (url: string) => `positions_cache_${url}`;
+  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+  // Clear cache when profile URL changes
+  useEffect(() => {
+    // Clear all position caches when URL changes (optional - can be removed if you want to keep cache)
+    // This ensures fresh data when switching profiles
+    return () => {
+      // Cache will be checked on next fetch, expired entries will be removed automatically
+    };
+  }, [profileUrls]);
+
+  // Fetch single profile positions
+  const fetchSingleProfile = async (url: string, index: number): Promise<Position[]> => {
+    if (!url || !url.trim()) {
+      return [];
     }
 
-    setLoading(true);
-    setError(null);
+    // Always fetch fresh data - don't use cache to skip scraping
+    // Cache is only used for storing results after scraping
+    const cacheKey = getCacheKey(url);
+    setLoadingStatus(prev => ({ ...prev, [index]: { loading: true, error: null } }));
 
     try {
-      console.log('Fetching positions for:', profileUrl);
+      console.log(`[Profile ${index + 1}] Fetching positions for:`, url);
       
       // Create abort controller for timeout (5 minutes for scraping)
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
       
-      const response = await fetch(`/api/scrape?profileUrl=${encodeURIComponent(profileUrl)}`, {
+      const response = await fetch(`/api/scrape?profileUrl=${encodeURIComponent(url)}`, {
         signal: controller.signal,
       });
       
       clearTimeout(timeoutId);
+      
+      // Check if request was aborted
+      if (controller.signal.aborted) {
+        return [];
+      }
       
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
@@ -66,33 +100,146 @@ export default function Home() {
       
       const data = await response.json();
 
+      // Check if request was aborted after response
+      if (controller.signal.aborted) {
+        return [];
+      }
+
       // Check if no positions found (but request was successful)
       if (data.positions && data.positions.length === 0) {
-        setError(data.message || 'No positions found. Make sure the URL includes ?tab=positions and the profile has active positions.');
-        setPositions([]);
-      } else {
-        console.log('Received positions:', data.positions?.length || 0);
-        setPositions(data.positions || []);
-        setError(null);
+        setLoadingStatus(prev => ({ 
+          ...prev, 
+          [index]: { 
+            loading: false, 
+            error: data.message || 'No positions found' 
+          } 
+        }));
+        return [];
       }
+
+      console.log(`[Profile ${index + 1}] Received positions:`, data.positions?.length || 0);
+      setLoadingStatus(prev => ({ ...prev, [index]: { loading: false, error: null } }));
+      
+      // Cache the results
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({
+          data,
+          timestamp: Date.now(),
+        }));
+        console.log(`[Profile ${index + 1}] Data cached successfully`);
+      } catch (e) {
+        console.warn(`[Profile ${index + 1}] Error caching data:`, e);
+      }
+
+      return data.positions || [];
     } catch (err: any) {
-      console.error('Error fetching positions:', err);
+      // Don't show error if request was aborted
       if (err.name === 'AbortError') {
-        setError('Request timeout. The scraping is taking longer than 5 minutes. This might happen with large profiles. Please try again or check if the profile URL is correct.');
-      } else if (err.message) {
-        setError(err.message);
-      } else {
-        setError('An error occurred while scraping. Please check the console for details.');
+        console.log(`[Profile ${index + 1}] Request aborted`);
+        setLoadingStatus(prev => ({ ...prev, [index]: { loading: false, error: null } }));
+        return [];
       }
-      setPositions([]);
-    } finally {
-      setLoading(false);
+      
+      console.error(`[Profile ${index + 1}] Error fetching positions:`, err);
+      const errorMessage = err.name === 'AbortError' 
+        ? 'Request timeout (5 minutes exceeded)'
+        : err.message || 'An error occurred while scraping';
+      
+      setLoadingStatus(prev => ({ 
+        ...prev, 
+        [index]: { loading: false, error: errorMessage } 
+      }));
+      
+      return [];
     }
   };
 
+  // Fetch positions with caching and duplicate request protection (supports multiple URLs)
+  const fetchPositions = useCallback(async () => {
+    // Protection: prevent duplicate requests using ref instead of state
+    if (isLoadingRef.current) {
+      console.log('Request already in progress, skipping...');
+      return;
+    }
+
+    // Filter out empty URLs
+    const validUrls = profileUrls.filter(url => url && url.trim());
+    
+    if (validUrls.length === 0) {
+      setError('Please enter at least one profile URL');
+      return;
+    }
+
+    // Limit to 3 URLs
+    const urlsToProcess = validUrls.slice(0, 3);
+    
+    isLoadingRef.current = true;
+    setLoading(true);
+    setError(null);
+    setPositions([]);
+    
+    // Initialize loading status for all URLs
+    const initialStatus: { [index: number]: { loading: boolean; error: string | null } } = {};
+    urlsToProcess.forEach((_, index) => {
+      initialStatus[index] = { loading: true, error: null };
+    });
+    setLoadingStatus(initialStatus);
+
+    try {
+      // Process up to 3 URLs in parallel
+      const promises = urlsToProcess.map((url, index) => fetchSingleProfile(url, index));
+      const results = await Promise.allSettled(promises);
+      
+      // Combine all results
+      const allPositions: Position[] = [];
+      const errors: string[] = [];
+      
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          allPositions.push(...result.value);
+        } else {
+          const errorMsg = result.reason?.message || `Failed to fetch profile ${index + 1}`;
+          errors.push(`Profile ${index + 1}: ${errorMsg}`);
+        }
+      });
+
+      // Remove duplicates based on marketUrl
+      const uniquePositions = allPositions.reduce((acc, pos) => {
+        const normalizedUrl = pos.marketUrl.split('?')[0].split('#')[0].toLowerCase().replace(/\/$/, '');
+        if (!acc.find(p => {
+          const pUrl = p.marketUrl.split('?')[0].split('#')[0].toLowerCase().replace(/\/$/, '');
+          return pUrl === normalizedUrl;
+        })) {
+          acc.push(pos);
+        }
+        return acc;
+      }, [] as Position[]);
+
+      setPositions(uniquePositions);
+      
+      if (errors.length > 0 && uniquePositions.length === 0) {
+        setError(errors.join('; '));
+      } else if (errors.length > 0) {
+        // Show warning but don't block if we have some results
+        console.warn('Some profiles failed:', errors);
+      } else {
+        setError(null);
+      }
+    } catch (err: any) {
+      console.error('Error in fetchPositions:', err);
+      setError(err.message || 'An error occurred while scraping');
+      setPositions([]);
+    } finally {
+      isLoadingRef.current = false;
+      setLoading(false);
+    }
+  }, [profileUrls]);
+
   // Auto-refresh effect with countdown
   useEffect(() => {
-    if (!autoRefresh || !profileUrl) {
+    const hasValidUrls = profileUrls.some(url => url && url.trim());
+    // Only enable auto-refresh if we have positions loaded
+    if (!autoRefresh || !hasValidUrls || positions.length === 0) {
       setTimeUntilRefresh(0);
       if (refreshIntervalRef.current) {
         clearInterval(refreshIntervalRef.current);
@@ -108,21 +255,17 @@ export default function Home() {
     const intervalMs = refreshIntervalMinutes * 60 * 1000;
     setTimeUntilRefresh(refreshIntervalMinutes * 60); // Set initial countdown in seconds
 
-    // Countdown timer
+    // Countdown timer - when reaches 0, trigger fetchPositions
     countdownIntervalRef.current = setInterval(() => {
       setTimeUntilRefresh((prev) => {
         if (prev <= 1) {
+          // When countdown reaches 0, trigger fetchPositions (like clicking "Scrape All")
+          fetchPositions();
           return refreshIntervalMinutes * 60; // Reset to full interval
         }
         return prev - 1;
       });
     }, 1000);
-
-    // Auto-refresh timer
-    refreshIntervalRef.current = setInterval(() => {
-      fetchPositions();
-      setTimeUntilRefresh(refreshIntervalMinutes * 60); // Reset countdown after refresh
-    }, intervalMs);
 
     return () => {
       if (refreshIntervalRef.current) {
@@ -132,42 +275,84 @@ export default function Home() {
         clearInterval(countdownIntervalRef.current);
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefresh, profileUrl, refreshIntervalMinutes]);
+  }, [autoRefresh, profileUrls, refreshIntervalMinutes, fetchPositions, positions.length]);
 
   // Get unique values for column filters (Excel-like)
   const uniqueColumnValues = useMemo(() => {
     return {
+      trader: Array.from(new Set(positions.map(p => p.trader).filter(Boolean))).sort(),
       marketName: Array.from(new Set(positions.map(p => p.marketName).filter(Boolean))).sort(),
       outcome: Array.from(new Set(positions.map(p => p.outcome).filter(Boolean))).sort(),
-      avgPrice: Array.from(new Set(positions.map(p => p.avgPrice).filter(Boolean))).sort(),
+      currentPrice: Array.from(new Set(positions.map(p => p.currentPrice).filter(Boolean))).sort(),
       value: Array.from(new Set(positions.map(p => p.value).filter(Boolean))).sort(),
     };
   }, [positions]);
+
+  // Debounce filter text (400ms)
+  useEffect(() => {
+    const timer = debounceTimersRef.current['filterText'];
+    if (timer) {
+      clearTimeout(timer);
+    }
+    
+    debounceTimersRef.current['filterText'] = setTimeout(() => {
+      setDebouncedFilterText(filterText);
+    }, 400);
+    
+    return () => {
+      if (debounceTimersRef.current['filterText']) {
+        clearTimeout(debounceTimersRef.current['filterText']);
+      }
+    };
+  }, [filterText]);
+
+  // Debounce column filters (400ms)
+  useEffect(() => {
+    const timer = debounceTimersRef.current['columnFilters'];
+    if (timer) {
+      clearTimeout(timer);
+    }
+    
+    debounceTimersRef.current['columnFilters'] = setTimeout(() => {
+      setDebouncedColumnFilters(columnFilters);
+    }, 400);
+    
+    return () => {
+      if (debounceTimersRef.current['columnFilters']) {
+        clearTimeout(debounceTimersRef.current['columnFilters']);
+      }
+    };
+  }, [columnFilters]);
 
   // Filtered and sorted positions
   const filteredAndSortedPositions = useMemo(() => {
     let filtered = positions;
 
-    // Apply global search filter
-    if (filterText) {
+    // Apply global search filter (using debounced value)
+    if (debouncedFilterText) {
       filtered = filtered.filter((pos) =>
-        pos.marketName.toLowerCase().includes(filterText.toLowerCase()) ||
-        pos.outcome.toLowerCase().includes(filterText.toLowerCase()) ||
-        pos.avgPrice.toLowerCase().includes(filterText.toLowerCase()) ||
-        pos.value.toLowerCase().includes(filterText.toLowerCase())
+        pos.trader.toLowerCase().includes(debouncedFilterText.toLowerCase()) ||
+        pos.marketName.toLowerCase().includes(debouncedFilterText.toLowerCase()) ||
+        pos.outcome.toLowerCase().includes(debouncedFilterText.toLowerCase()) ||
+        pos.currentPrice.toLowerCase().includes(debouncedFilterText.toLowerCase()) ||
+        pos.value.toLowerCase().includes(debouncedFilterText.toLowerCase())
       );
     }
 
-    // Apply column filters (Excel-like)
-    if (columnFilters.marketName) {
+    // Apply column filters (Excel-like) (using debounced values)
+    if (debouncedColumnFilters.trader) {
       filtered = filtered.filter((pos) =>
-        pos.marketName.toLowerCase().includes(columnFilters.marketName.toLowerCase())
+        pos.trader.toLowerCase().includes(debouncedColumnFilters.trader.toLowerCase())
       );
     }
-    if (columnFilters.outcome) {
+    if (debouncedColumnFilters.marketName) {
       filtered = filtered.filter((pos) =>
-        pos.outcome.toLowerCase().includes(columnFilters.outcome.toLowerCase())
+        pos.marketName.toLowerCase().includes(debouncedColumnFilters.marketName.toLowerCase())
+      );
+    }
+    if (debouncedColumnFilters.outcome) {
+      filtered = filtered.filter((pos) =>
+        pos.outcome.toLowerCase().includes(debouncedColumnFilters.outcome.toLowerCase())
       );
     }
     // Helper function to parse numeric value from string (handles $, commas, ¢)
@@ -186,25 +371,25 @@ export default function Home() {
       return parseFloat(cleaned) || 0;
     };
     
-    if (columnFilters.avgPrice) {
+    if (debouncedColumnFilters.currentPrice) {
       filtered = filtered.filter((pos) =>
-        pos.avgPrice.toLowerCase().includes(columnFilters.avgPrice.toLowerCase())
+        pos.currentPrice.toLowerCase().includes(debouncedColumnFilters.currentPrice.toLowerCase())
       );
     }
     
-    // Apply range filter for Avg Price
-    if (rangeFilters.avgPrice.min || rangeFilters.avgPrice.max) {
+    // Apply range filter for Current Price
+    if (rangeFilters.currentPrice.min || rangeFilters.currentPrice.max) {
       filtered = filtered.filter((pos) => {
-        const priceValue = parseNumericValue(pos.avgPrice);
-        const min = rangeFilters.avgPrice.min ? parseFloat(rangeFilters.avgPrice.min) : -Infinity;
-        const max = rangeFilters.avgPrice.max ? parseFloat(rangeFilters.avgPrice.max) : Infinity;
+        const priceValue = parseNumericValue(pos.currentPrice);
+        const min = rangeFilters.currentPrice.min ? parseFloat(rangeFilters.currentPrice.min) : -Infinity;
+        const max = rangeFilters.currentPrice.max ? parseFloat(rangeFilters.currentPrice.max) : Infinity;
         return priceValue >= min && priceValue <= max;
       });
     }
     
-    if (columnFilters.value) {
+    if (debouncedColumnFilters.value) {
       filtered = filtered.filter((pos) =>
-        pos.value.toLowerCase().includes(columnFilters.value.toLowerCase())
+        pos.value.toLowerCase().includes(debouncedColumnFilters.value.toLowerCase())
       );
     }
     
@@ -227,9 +412,12 @@ export default function Home() {
         if (sortField === 'value') {
           aValue = parseFloat(a.value.replace(/[^0-9.-]+/g, '')) || 0;
           bValue = parseFloat(b.value.replace(/[^0-9.-]+/g, '')) || 0;
-        } else if (sortField === 'avgPrice') {
-          aValue = parseFloat(a.avgPrice.replace(/[^0-9.-]+/g, '')) || 0;
-          bValue = parseFloat(b.avgPrice.replace(/[^0-9.-]+/g, '')) || 0;
+        } else if (sortField === 'currentPrice') {
+          aValue = parseFloat(a.currentPrice.replace(/[^0-9.-]+/g, '')) || 0;
+          bValue = parseFloat(b.currentPrice.replace(/[^0-9.-]+/g, '')) || 0;
+        } else if (sortField === 'trader') {
+          aValue = a.trader.toLowerCase();
+          bValue = b.trader.toLowerCase();
         } else if (sortField === 'marketName') {
           aValue = a.marketName.toLowerCase();
           bValue = b.marketName.toLowerCase();
@@ -249,7 +437,7 @@ export default function Home() {
     }
 
     return filtered;
-  }, [positions, filterText, columnFilters, rangeFilters, sortField, sortDirection]);
+  }, [positions, debouncedFilterText, debouncedColumnFilters, rangeFilters, sortField, sortDirection]);
 
   // Handle sort
   const handleSort = (field: SortField) => {
@@ -273,7 +461,7 @@ export default function Home() {
     setColumnFilters((prev) => ({ ...prev, [column]: '' }));
   };
   
-  const clearRangeFilter = (column: 'avgPrice' | 'value') => {
+  const clearRangeFilter = (column: 'currentPrice' | 'value') => {
     setRangeFilters((prev) => ({ 
       ...prev, 
       [column]: { min: '', max: '' } 
@@ -289,92 +477,131 @@ export default function Home() {
 
         {/* Input Section */}
         <div className="bg-gray-900 rounded-lg p-6 mb-6 border border-gray-800">
-          <div className="flex flex-col md:flex-row gap-4">
-            <div className="flex-1">
-              <label htmlFor="profileUrl" className="block text-sm font-medium mb-2">
-                Profile URL
-              </label>
-              <input
-                id="profileUrl"
-                name="profileUrl"
-                type="text"
-                value={profileUrl}
-                onChange={(e) => setProfileUrl(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !loading) {
-                    fetchPositions();
-                  }
-                }}
-                placeholder="https://polymarket.com/@Username?tab=positions"
-                className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white"
-                disabled={loading}
-              />
-            </div>
-            <div className="flex items-end gap-2">
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  console.log('Scrape button clicked');
-                  fetchPositions();
-                }}
-                disabled={loading || !profileUrl}
-                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:cursor-not-allowed rounded-lg font-medium flex items-center gap-2 transition-colors"
-              >
-                {loading ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Scraping...
-                  </>
-                ) : (
-                  <>
-                    <RefreshCw className="w-4 h-4" />
-                    Scrape
-                  </>
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold mb-2">Profile URLs (up to 3)</h2>
+            <p className="text-sm text-gray-400 mb-4">
+              Enter up to 3 profile URLs to scrape simultaneously. All processes will run in parallel.
+            </p>
+          </div>
+          
+          <div className="space-y-3 mb-4">
+            {profileUrls.map((url, index) => (
+              <div key={index} className="flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <label htmlFor={`profileUrl${index}`} className="block text-sm font-medium min-w-[80px]">
+                    Profile {index + 1}:
+                  </label>
+                  <div className="flex-1 relative">
+                    <input
+                      id={`profileUrl${index}`}
+                      name={`profileUrl${index}`}
+                      type="text"
+                      value={url}
+                      onChange={(e) => {
+                        const newUrls = [...profileUrls];
+                        newUrls[index] = e.target.value;
+                        setProfileUrls(newUrls);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !loading) {
+                          fetchPositions();
+                        }
+                      }}
+                      placeholder="https://polymarket.com/@Username?tab=positions"
+                      className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white"
+                      disabled={loading}
+                    />
+                    {loadingStatus[index]?.loading && (
+                      <div className="absolute right-3 top-1/2 transform -translate-y-1/2">
+                        <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {loadingStatus[index]?.error && (
+                  <div className="ml-[88px] text-sm text-red-400">
+                    Error: {loadingStatus[index].error}
+                  </div>
                 )}
-              </button>
-            </div>
+              </div>
+            ))}
+          </div>
+          
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('Scrape button clicked, loading:', loading, 'isLoadingRef:', isLoadingRef.current);
+                if (!isLoadingRef.current) {
+                  fetchPositions();
+                } else {
+                  console.log('Button click ignored - request in progress');
+                }
+              }}
+              disabled={loading || !profileUrls.some(url => url && url.trim())}
+              className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:cursor-not-allowed rounded-lg font-medium flex items-center gap-2 transition-colors"
+            >
+              {loading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Scraping...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="w-4 h-4" />
+                  Scrape All ({profileUrls.filter(url => url && url.trim()).length} URL{profileUrls.filter(url => url && url.trim()).length !== 1 ? 's' : ''})
+                </>
+              )}
+            </button>
+            {loading && (
+              <div className="text-sm text-gray-400">
+                Processing {Object.values(loadingStatus).filter(s => s.loading).length} profile(s)...
+              </div>
+            )}
           </div>
 
-          {/* Auto-refresh toggle with interval selection */}
-          <div className="mt-4 flex flex-col md:flex-row items-start md:items-center gap-4">
-            <label htmlFor="autoRefresh" className="flex items-center gap-2 cursor-pointer">
-              <input
-                id="autoRefresh"
-                name="autoRefresh"
-                type="checkbox"
-                checked={autoRefresh}
-                onChange={(e) => setAutoRefresh(e.target.checked)}
-                className="w-4 h-4 rounded bg-gray-800 border-gray-700 text-blue-600 focus:ring-blue-500"
-              />
-              <span className="text-sm">Auto-refresh every</span>
-            </label>
-            <div className="flex items-center gap-2">
-              <select
-                id="refreshInterval"
-                name="refreshInterval"
-                value={refreshIntervalMinutes}
-                onChange={(e) => setRefreshIntervalMinutes(Number(e.target.value))}
-                disabled={!autoRefresh}
-                className="px-3 py-1 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <option value={0.5}>30 seconds</option>
-                <option value={1}>1 minute</option>
-                <option value={2}>2 minutes</option>
-                <option value={5}>5 minutes</option>
-                <option value={10}>10 minutes</option>
-                <option value={15}>15 minutes</option>
-                <option value={30}>30 minutes</option>
-                <option value={60}>1 hour</option>
-              </select>
-              {autoRefresh && timeUntilRefresh > 0 && (
-                <span className="text-sm text-blue-400 font-mono">
-                  Next refresh in: {formatCountdown(timeUntilRefresh)}
-                </span>
-              )}
+          {/* Auto-refresh toggle with interval selection - only show after data is loaded */}
+          {positions.length > 0 && (
+            <div className="mt-4 flex flex-col md:flex-row items-start md:items-center gap-4">
+              <label htmlFor="autoRefresh" className="flex items-center gap-2 cursor-pointer">
+                <input
+                  id="autoRefresh"
+                  name="autoRefresh"
+                  type="checkbox"
+                  checked={autoRefresh}
+                  onChange={(e) => setAutoRefresh(e.target.checked)}
+                  className="w-4 h-4 rounded bg-gray-800 border-gray-700 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="text-sm">Auto-refresh every</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <select
+                  id="refreshInterval"
+                  name="refreshInterval"
+                  value={refreshIntervalMinutes}
+                  onChange={(e) => setRefreshIntervalMinutes(Number(e.target.value))}
+                  disabled={!autoRefresh}
+                  className="px-3 py-1 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <option value={0.5}>30 seconds</option>
+                  <option value={1}>1 minute</option>
+                  <option value={2}>2 minutes</option>
+                  <option value={5}>5 minutes</option>
+                  <option value={10}>10 minutes</option>
+                  <option value={15}>15 minutes</option>
+                  <option value={30}>30 minutes</option>
+                  <option value={60}>1 hour</option>
+                </select>
+                {autoRefresh && timeUntilRefresh > 0 && (
+                  <span className="text-sm text-blue-400 font-mono">
+                    Next refresh in: {formatCountdown(timeUntilRefresh)}
+                  </span>
+                )}
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         {/* Error Message */}
@@ -403,6 +630,37 @@ export default function Home() {
             
             {/* Column Filters (Excel-like) */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {/* Trader Filter */}
+              <div className="relative">
+                <label className="block text-xs text-gray-400 mb-1">Trader</label>
+                <div className="relative">
+                  <Filter className="absolute left-2 top-1/2 transform -translate-y-1/2 w-3 h-3 text-gray-400" />
+                  <input
+                    id="filterTrader"
+                    name="filterTrader"
+                    type="text"
+                    value={columnFilters.trader}
+                    onChange={(e) => setColumnFilters(prev => ({ ...prev, trader: e.target.value }))}
+                    placeholder="Filter trader..."
+                    list="traderOptions"
+                    className="w-full pl-7 pr-7 py-1.5 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
+                  />
+                  {columnFilters.trader && (
+                    <button
+                      onClick={() => clearColumnFilter('trader')}
+                      className="absolute right-1.5 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-white"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+                <datalist id="traderOptions">
+                  {uniqueColumnValues.trader.map((value, idx) => (
+                    <option key={idx} value={value} />
+                  ))}
+                </datalist>
+              </div>
+
               {/* Market Name Filter */}
               <div className="relative">
                 <label className="block text-xs text-gray-400 mb-1">Market</label>
@@ -465,9 +723,9 @@ export default function Home() {
                 </datalist>
               </div>
 
-              {/* Avg Price Filter */}
+              {/* Current Price Filter */}
               <div className="relative">
-                <label className="block text-xs text-gray-400 mb-1">Avg Price</label>
+                <label className="block text-xs text-gray-400 mb-1">Current Price</label>
                 <div className="space-y-1.5">
                   {/* Text filter */}
                   <div className="relative">
@@ -476,15 +734,15 @@ export default function Home() {
                       id="filterPrice"
                       name="filterPrice"
                       type="text"
-                      value={columnFilters.avgPrice}
-                      onChange={(e) => setColumnFilters(prev => ({ ...prev, avgPrice: e.target.value }))}
-                      placeholder="Filter avg price..."
+                      value={columnFilters.currentPrice}
+                      onChange={(e) => setColumnFilters(prev => ({ ...prev, currentPrice: e.target.value }))}
+                      placeholder="Filter price..."
                       list="priceOptions"
                       className="w-full pl-7 pr-7 py-1.5 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
                     />
-                    {columnFilters.avgPrice && (
+                    {columnFilters.currentPrice && (
                       <button
-                        onClick={() => clearColumnFilter('avgPrice')}
+                        onClick={() => clearColumnFilter('currentPrice')}
                         className="absolute right-1.5 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-white"
                       >
                         <X className="w-3 h-3" />
@@ -492,38 +750,38 @@ export default function Home() {
                     )}
                   </div>
                   {/* Range filter */}
-                  <div className="flex gap-1.5 items-center">
+                  <div className="flex gap-1 items-center w-full">
                     <input
                       id="filterPriceMin"
                       name="filterPriceMin"
                       type="number"
                       step="0.01"
-                      value={rangeFilters.avgPrice.min}
+                      value={rangeFilters.currentPrice.min}
                       onChange={(e) => setRangeFilters(prev => ({ 
                         ...prev, 
-                        avgPrice: { ...prev.avgPrice, min: e.target.value } 
+                        currentPrice: { ...prev.currentPrice, min: e.target.value } 
                       }))}
                       placeholder="Min"
-                      className="flex-1 px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
+                      className="flex-1 min-w-0 px-1.5 md:px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
                     />
-                    <span className="text-gray-500 text-xs">-</span>
+                    <span className="text-gray-500 text-xs flex-shrink-0 px-0.5">-</span>
                     <input
                       id="filterPriceMax"
                       name="filterPriceMax"
                       type="number"
                       step="0.01"
-                      value={rangeFilters.avgPrice.max}
+                      value={rangeFilters.currentPrice.max}
                       onChange={(e) => setRangeFilters(prev => ({ 
                         ...prev, 
-                        avgPrice: { ...prev.avgPrice, max: e.target.value } 
+                        currentPrice: { ...prev.currentPrice, max: e.target.value } 
                       }))}
                       placeholder="Max"
-                      className="flex-1 px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
+                      className="flex-1 min-w-0 px-1.5 md:px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
                     />
-                    {(rangeFilters.avgPrice.min || rangeFilters.avgPrice.max) && (
+                    {(rangeFilters.currentPrice.min || rangeFilters.currentPrice.max) && (
                       <button
-                        onClick={() => clearRangeFilter('avgPrice')}
-                        className="text-gray-400 hover:text-white p-0.5"
+                        onClick={() => clearRangeFilter('currentPrice')}
+                        className="text-gray-400 hover:text-white p-0.5 flex-shrink-0"
                         title="Clear range"
                       >
                         <X className="w-3 h-3" />
@@ -532,7 +790,7 @@ export default function Home() {
                   </div>
                 </div>
                 <datalist id="priceOptions">
-                  {uniqueColumnValues.avgPrice.map((value, idx) => (
+                  {uniqueColumnValues.currentPrice.map((value, idx) => (
                     <option key={idx} value={value} />
                   ))}
                 </datalist>
@@ -565,7 +823,7 @@ export default function Home() {
                     )}
                   </div>
                   {/* Range filter */}
-                  <div className="flex gap-1.5 items-center">
+                  <div className="flex gap-1 items-center w-full">
                     <input
                       id="filterValueMin"
                       name="filterValueMin"
@@ -577,9 +835,9 @@ export default function Home() {
                         value: { ...prev.value, min: e.target.value } 
                       }))}
                       placeholder="Min"
-                      className="flex-1 px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
+                      className="flex-1 min-w-0 px-1.5 md:px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
                     />
-                    <span className="text-gray-500 text-xs">-</span>
+                    <span className="text-gray-500 text-xs flex-shrink-0 px-0.5">-</span>
                     <input
                       id="filterValueMax"
                       name="filterValueMax"
@@ -591,12 +849,12 @@ export default function Home() {
                         value: { ...prev.value, max: e.target.value } 
                       }))}
                       placeholder="Max"
-                      className="flex-1 px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
+                      className="flex-1 min-w-0 px-1.5 md:px-2 py-1 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-white text-xs"
                     />
                     {(rangeFilters.value.min || rangeFilters.value.max) && (
                       <button
                         onClick={() => clearRangeFilter('value')}
-                        className="text-gray-400 hover:text-white p-0.5"
+                        className="text-gray-400 hover:text-white p-0.5 flex-shrink-0"
                         title="Clear range"
                       >
                         <X className="w-3 h-3" />
@@ -625,8 +883,23 @@ export default function Home() {
               <table className="w-full">
                 <thead className="bg-gray-800 border-b border-gray-700">
                   <tr>
-                    <th className="px-4 py-3 text-left text-sm font-semibold text-gray-300">
-                      Market
+                    <th
+                      className="px-4 py-3 text-left text-sm font-semibold text-gray-300 cursor-pointer hover:bg-gray-750 transition-colors"
+                      onClick={() => handleSort('trader')}
+                    >
+                      <div className="flex items-center gap-2">
+                        Trader
+                        <ArrowUpDown className="w-4 h-4" />
+                      </div>
+                    </th>
+                    <th
+                      className="px-4 py-3 text-left text-sm font-semibold text-gray-300 cursor-pointer hover:bg-gray-750 transition-colors"
+                      onClick={() => handleSort('marketName')}
+                    >
+                      <div className="flex items-center gap-2">
+                        Market
+                        <ArrowUpDown className="w-4 h-4" />
+                      </div>
                     </th>
                     <th
                       className="px-4 py-3 text-left text-sm font-semibold text-gray-300 cursor-pointer hover:bg-gray-750 transition-colors"
@@ -639,10 +912,10 @@ export default function Home() {
                     </th>
                     <th
                       className="px-4 py-3 text-left text-sm font-semibold text-gray-300 cursor-pointer hover:bg-gray-750 transition-colors"
-                      onClick={() => handleSort('avgPrice')}
+                      onClick={() => handleSort('currentPrice')}
                     >
                       <div className="flex items-center gap-2">
-                        Avg Price
+                        Current Price
                         <ArrowUpDown className="w-4 h-4" />
                       </div>
                     </th>
@@ -664,6 +937,9 @@ export default function Home() {
                         key={`${position.marketUrl}-${index}`}
                         className="hover:bg-gray-800/50 transition-colors"
                       >
+                        <td className="px-4 py-3 text-gray-300 font-medium">
+                          {position.trader || '-'}
+                        </td>
                         <td className="px-4 py-3">
                           <a
                             href={position.marketUrl}
@@ -679,7 +955,7 @@ export default function Home() {
                           {position.outcome || '-'}
                         </td>
                         <td className="px-4 py-3 text-gray-300 font-mono">
-                          {position.avgPrice || '-'}
+                          {position.currentPrice || '-'}
                         </td>
                         <td className="px-4 py-3 text-gray-300 font-mono">
                           {position.value || '-'}
@@ -688,7 +964,7 @@ export default function Home() {
                     ))
                   ) : (
                     <tr>
-                      <td colSpan={4} className="px-4 py-8 text-center text-gray-400">
+                      <td colSpan={5} className="px-4 py-8 text-center text-gray-400">
                         No positions match the filter criteria
                       </td>
                     </tr>

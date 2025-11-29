@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import puppeteer from 'puppeteer';
 
 export interface Position {
+  trader: string;
   marketName: string;
   marketUrl: string;
   outcome: string;
-  avgPrice: string;
+  currentPrice: string;
   value: string;
 }
 
@@ -89,6 +90,26 @@ export async function GET(request: NextRequest) {
       throw new Error('Invalid page: not a Polymarket URL');
     }
 
+    // Extract trader name from profile URL
+    // Examples: https://polymarket.com/@FirstOrder -> FirstOrder
+    //           https://polymarket.com/@username -> username
+    let traderName = '';
+    try {
+      const urlObj = new URL(profileUrl);
+      const pathMatch = urlObj.pathname.match(/@([^/?]+)/);
+      if (pathMatch && pathMatch[1]) {
+        traderName = pathMatch[1];
+      } else {
+        // Fallback: try to extract from page URL
+        const pagePathMatch = pageUrl.match(/@([^/?]+)/);
+        if (pagePathMatch && pagePathMatch[1]) {
+          traderName = pagePathMatch[1];
+        }
+      }
+    } catch (e) {
+      console.warn('Could not extract trader name from URL:', e);
+    }
+
     // Wait for market links to appear (with multiple attempts)
     let linksFound = false;
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -170,7 +191,7 @@ export async function GET(request: NextRequest) {
     console.log(`Found ${linkCountBefore} market links before extraction`);
 
     // Extract positions data using improved logic
-    const positions = await page.evaluate(() => {
+    const positions = await page.evaluate((trader) => {
       const results: Position[] = [];
 
       // Find ALL market links (not just with specific classes)
@@ -285,32 +306,33 @@ export async function GET(request: NextRequest) {
             }
           }
 
-          // Extract avg price using multiple strategies
-          let avgPriceValue = '';
+          // Extract current price using multiple strategies (not avg)
+          let currentPrice = '';
           
-          // Strategy 0: If table row, look for avg price in cells
+          // Strategy 0: If table row, look for current price in cells (not avg)
           if (isTableRow && cells.length > 0) {
             for (const cell of cells) {
               const cellText = cell.textContent || '';
               const cellLower = cellText.toLowerCase();
-              // Look for avg price pattern
-              if (cellLower.includes('avg') || cellLower.includes('average') || cellLower.includes('at')) {
-                const priceMatch = cellText.match(/(\d+\.?\d*)\s*¢/);
-                if (priceMatch) {
-                  avgPriceValue = priceMatch[0];
+              // Look for price pattern that's not avg
+              const priceMatch = cellText.match(/(\d+\.?\d*)\s*¢/);
+              if (priceMatch) {
+                // Skip if it's avg price
+                if (!cellLower.includes('at') && !cellLower.includes('avg') && !cellLower.includes('average')) {
+                  currentPrice = priceMatch[0];
                   break;
                 }
               }
             }
           }
           
-          // Strategy 1: Find all price elements and look for avg
+          // Strategy 1: Find all price elements (spans, divs with ¢)
           const priceElements = Array.from(container.querySelectorAll('span, div, p, td, th')).filter(el => {
             const text = el.textContent || '';
             return /\d+\.?\d*\s*¢/.test(text);
           });
 
-          // Strategy 2: Look for price that IS avg
+          // Strategy 2: Look for price that is NOT avg
           for (const el of priceElements) {
             const text = el.textContent || '';
             const priceMatch = text.match(/(\d+\.?\d*)\s*¢/);
@@ -319,38 +341,39 @@ export async function GET(request: NextRequest) {
               const parentText = el.parentElement?.textContent || '';
               const context = (fullText + ' ' + parentText).toLowerCase();
               
-              // Check if it's avg price
+              // Check if it's avg price - skip if it is
               const isAvg = /at\s+\d+\.?\d*\s*¢/i.test(context) || 
                            /avg[:\s]+\d+\.?\d*\s*¢/i.test(context) ||
                            /average[:\s]+\d+\.?\d*\s*¢/i.test(context);
               
-              if (isAvg) {
-                avgPriceValue = priceMatch[0];
+              if (!isAvg) {
+                currentPrice = priceMatch[0];
                 break;
               }
             }
           }
 
-          // Strategy 3: Look for avg patterns in text
-          if (!avgPriceValue) {
-            const avgPatterns = [
-              /avg[:\s]+(\d+\.?\d*)\s*¢/i,
-              /average[:\s]+(\d+\.?\d*)\s*¢/i,
-              /at\s+(\d+\.?\d*)\s*¢/i,
-            ];
-            
-            for (const pattern of avgPatterns) {
-              const match = containerText.match(pattern);
-              if (match && match[1]) {
-                avgPriceValue = `${match[1]}¢`;
-                break;
+          // Strategy 3: Look for all prices and take the one that's not avg
+          if (!currentPrice) {
+            const allPrices = containerText.match(/(\d+\.?\d*)\s*¢/g);
+            if (allPrices && allPrices.length > 0) {
+              for (const priceMatch of allPrices) {
+                const priceValue = priceMatch.match(/(\d+\.?\d*)/)?.[1];
+                if (priceValue && priceValue !== avgPrice) {
+                  const priceIndex = containerText.indexOf(priceMatch);
+                  const beforeText = containerText.substring(
+                    Math.max(0, priceIndex - 50),
+                    priceIndex
+                  ).toLowerCase();
+                  
+                  // Check if it's clearly not avg
+                  if (!beforeText.includes('at') && !beforeText.includes('avg') && !beforeText.includes('average')) {
+                    currentPrice = priceMatch;
+                    break;
+                  }
+                }
               }
             }
-          }
-          
-          // Strategy 4: If we already found avgPrice earlier, use it
-          if (!avgPriceValue && avgPrice) {
-            avgPriceValue = `${avgPrice}¢`;
           }
 
           // Extract value (dollar amount) using multiple strategies
@@ -421,41 +444,114 @@ export async function GET(request: NextRequest) {
             }
           }
 
-          // Calculate outcome = Value / Avg Price
-          // Note: Avg Price is in cents (¢), Value is in dollars ($)
+          // Extract outcome - full text value under market name (e.g., "Down" or "3 799,4 shares at 61¢")
+          // Keep the text as it appears on the site
           let outcome = '';
-          if (avgPriceValue && value) {
-            try {
-              // Extract numeric value from avgPriceValue (remove ¢ and parse)
-              // Price is in cents, so we need to convert to dollars by dividing by 100
-              const priceMatch = avgPriceValue.match(/(\d+\.?\d*)/);
-              const priceInCents = priceMatch ? parseFloat(priceMatch[1]) : 0;
-              const priceInDollars = priceInCents / 100; // Convert cents to dollars
-              
-              // Extract numeric value from value (remove $, commas and parse)
-              const valueMatch = value.match(/([\d,]+\.?\d*)/);
-              const valueStr = valueMatch ? valueMatch[1].replace(/,/g, '') : '0';
-              const valueNum = parseFloat(valueStr);
-              
-              // Calculate outcome = value / avgPrice (both in dollars)
-              if (priceInDollars > 0 && !isNaN(valueNum) && !isNaN(priceInDollars)) {
-                const outcomeNum = valueNum / priceInDollars;
-                // Format with 2 decimal places
-                outcome = outcomeNum.toFixed(2);
+          
+          // Strategy 1: Look for text right after market link (sibling elements)
+          const linkParent = link.parentElement;
+          if (linkParent) {
+            // Check next sibling elements
+            let current: Element | null = linkParent.nextElementSibling;
+            let depth = 0;
+            while (current && depth < 5) {
+              const text = (current.textContent || '').trim();
+              // Look for pattern: "number shares at price" or outcome name
+              if (text.includes('shares') && text.includes('at')) {
+                // Extract full text including shares and price
+                const sharesPattern = /([\d\s,]+\.?\d*)\s+shares\s+at\s+(\d+\.?\d*)\s*¢/i;
+                const match = text.match(sharesPattern);
+                if (match) {
+                  outcome = match[0].trim(); // Full match: "3 799,4 shares at 61¢"
+                  break;
+                }
+              } else if (text.length > 0 && text.length < 50) {
+                // Could be outcome name like "Down", "Up", "Yes", "No"
+                const outcomeNames = ['Down', 'Up', 'Yes', 'No', 'Trump', 'Biden'];
+                if (outcomeNames.some(name => text.includes(name))) {
+                  outcome = text;
+                  break;
+                }
               }
-            } catch (calcError) {
-              // If calculation fails, leave outcome empty
-              console.error('Error calculating outcome:', calcError);
+              current = current.nextElementSibling;
+              depth++;
+            }
+            
+            // If not found, check parent container's text after market name
+            if (!outcome) {
+              const parentText = linkParent.textContent || '';
+              const marketIndex = parentText.indexOf(marketName);
+              if (marketIndex >= 0) {
+                // Get text after market name (up to 300 chars)
+                const afterMarket = parentText.substring(marketIndex + marketName.length, marketIndex + marketName.length + 300).trim();
+                // Look for shares pattern
+                const sharesPattern = /([\d\s,]+\.?\d*)\s+shares\s+at\s+(\d+\.?\d*)\s*¢/i;
+                const match = afterMarket.match(sharesPattern);
+                if (match) {
+                  outcome = match[0].trim();
+                } else {
+                  // Try to find outcome name or first meaningful text
+                  const firstLine = afterMarket.split('\n')[0].trim();
+                  if (firstLine.length > 0 && firstLine.length < 100) {
+                    outcome = firstLine;
+                  }
+                }
+              }
+            }
+          }
+          
+          // Strategy 2: Search in container text for shares pattern or outcome name
+          if (!outcome) {
+            // Pattern: "number shares at price" - keep full text
+            const sharesPattern = /([\d\s,]+\.?\d*)\s+shares\s+at\s+(\d+\.?\d*)\s*¢/i;
+            const match = containerText.match(sharesPattern);
+            if (match) {
+              outcome = match[0].trim();
+            } else {
+              // Look for outcome name near market name
+              const outcomeNames = ['Down', 'Up', 'Yes', 'No', 'Trump', 'Biden'];
+              const marketIndex = containerText.indexOf(marketName);
+              if (marketIndex >= 0) {
+                const afterMarket = containerText.substring(marketIndex + marketName.length, marketIndex + marketName.length + 200);
+                for (const name of outcomeNames) {
+                  const nameIndex = afterMarket.indexOf(name);
+                  if (nameIndex >= 0 && nameIndex < 100) {
+                    // Get text starting from outcome name
+                    const outcomeText = afterMarket.substring(nameIndex).split('\n')[0].trim();
+                    if (outcomeText.length > 0 && outcomeText.length < 150) {
+                      outcome = outcomeText;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+          // Strategy 3: If still not found, try to find text after market name in container
+          if (!outcome) {
+            const marketIndex = containerText.indexOf(marketName);
+            if (marketIndex >= 0) {
+              const afterMarket = containerText.substring(marketIndex + marketName.length).trim();
+              // Get first meaningful line (not empty, reasonable length)
+              const lines = afterMarket.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+              if (lines.length > 0) {
+                const firstLine = lines[0];
+                if (firstLine.length > 0 && firstLine.length < 200) {
+                  outcome = firstLine;
+                }
+              }
             }
           }
 
           // Only add if we have at least market URL
           if (marketUrl) {
             const position = {
+              trader: trader || '',
               marketName: marketName || 'Unknown Market',
               marketUrl,
               outcome: outcome || '',
-              avgPrice: avgPriceValue || '',
+              currentPrice: currentPrice || '',
               value: value || '',
             };
             
@@ -464,9 +560,8 @@ export async function GET(request: NextRequest) {
               console.log('Parsed position:', {
                 market: position.marketName.substring(0, 50),
                 outcome: position.outcome || '(empty)',
-                avgPrice: position.avgPrice || '(empty)',
+                currentPrice: position.currentPrice || '(empty)',
                 value: position.value || '(empty)',
-                calculation: outcome ? `outcome = ${value} / (${avgPriceValue} / 100)` : 'calculation failed',
               });
             }
             
@@ -491,7 +586,7 @@ export async function GET(request: NextRequest) {
       }
 
       return uniqueResults;
-    });
+    }, traderName);
 
     await browser.close();
 
